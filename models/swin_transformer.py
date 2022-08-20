@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 import torch.utils.checkpoint as checkpoint
 from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from .quantization import quan_Linear, quan_Conv2d
 
 try:
     import os, sys
@@ -28,9 +29,9 @@ class Mlp(nn.Module):
         super().__init__()
         out_features = out_features or in_features
         hidden_features = hidden_features or in_features
-        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.fc1 = quan_Linear(in_features, hidden_features)
         self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.fc2 = quan_Linear(hidden_features, out_features)
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
@@ -114,9 +115,9 @@ class WindowAttention(nn.Module):
         relative_position_index = relative_coords.sum(-1)  # Wh*Ww, Wh*Ww
         self.register_buffer("relative_position_index", relative_position_index)
 
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.qkv = quan_Linear(dim, dim * 3, bias=qkv_bias)
         self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
+        self.proj = quan_Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
         trunc_normal_(self.relative_position_bias_table, std=.02)
@@ -325,7 +326,7 @@ class PatchMerging(nn.Module):
         super().__init__()
         self.input_resolution = input_resolution
         self.dim = dim
-        self.reduction = nn.Linear(4 * dim, 2 * dim, bias=False)
+        self.reduction = quan_Linear(4 * dim, 2 * dim, bias=False)
         self.norm = norm_layer(4 * dim)
 
     def forward(self, x):
@@ -458,7 +459,7 @@ class PatchEmbed(nn.Module):
         self.in_chans = in_chans
         self.embed_dim = embed_dim
 
-        self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.proj = quan_Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
         if norm_layer is not None:
             self.norm = norm_layer(embed_dim)
         else:
@@ -514,7 +515,8 @@ class SwinTransformer(nn.Module):
                  window_size=7, mlp_ratio=4., qkv_bias=True, qk_scale=None,
                  drop_rate=0., attn_drop_rate=0., drop_path_rate=0.1,
                  norm_layer=nn.LayerNorm, ape=False, patch_norm=True,
-                 use_checkpoint=False, fused_window_process=False, **kwargs):
+                 use_checkpoint=False, fused_window_process=False,
+                 quan_bitwidth: int = 8, quan_reset_weight: bool = False, **kwargs):
         super().__init__()
 
         self.num_classes = num_classes
@@ -564,18 +566,40 @@ class SwinTransformer(nn.Module):
 
         self.norm = norm_layer(self.num_features)
         self.avgpool = nn.AdaptiveAvgPool1d(1)
-        self.head = nn.Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
+        self.head = quan_Linear(self.num_features, num_classes) if num_classes > 0 else nn.Identity()
 
         self.apply(self._init_weights)
+        self._init_quantization()
 
     def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
+        if isinstance(m, quan_Linear):
             trunc_normal_(m.weight, std=.02)
-            if isinstance(m, nn.Linear) and m.bias is not None:
+            if isinstance(m, quan_Linear) and m.bias is not None:
                 nn.init.constant_(m.bias, 0)
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
+    
+    def _init_quantization(self):
+        # Configure the quantization bit-width
+        def _reset_bitwidth(m):
+            if isinstance(m, quan_Conv2d) or isinstance(m, quan_Linear):
+                m.N_bits = self.quan_bitwidth
+                m.b_w.data = m.b_w.data[-m.N_bits:]
+                m.b_w[0] = -m.b_w[0]
+        self.apply(_reset_bitwidth)
+        # Update the step_size once the model is loaded. This is used for quantization.
+        def _reset_stepsize(m):
+            if isinstance(m, quan_Conv2d) or isinstance(m, quan_Linear):
+                # simple step size update based on the pretrained model or weight init
+                m.__reset_stepsize__()
+        self.apply(_reset_stepsize)
+        # Block for weight reset.
+        if self.quan_reset_weight:
+            def _reset_weight(m):
+                if isinstance(m, quan_Conv2d) or isinstance(m, quan_Linear):
+                    m.__reset_weight__()
+            self.apply(_reset_weight)
 
     @torch.jit.ignore
     def no_weight_decay(self):
